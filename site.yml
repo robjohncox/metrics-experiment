@@ -1,0 +1,490 @@
+# This is a prototype, and a number of improvements required for production standard deployment:
+#  - Use latest versions of software, playbooks used installed old versions (we would probably
+#    want to write our own playbooks).
+#  - Hide all web interfaces behind reverse proxies, and use these to refer to each other
+#  - Do not install Prometheus, Alertmanager etc if already exists
+#  - Each Prometheus metrics endpoint should deploy it's own configuration
+#  - Prometheus data would need to be purged periodically
+#  - Grafana requires proper authentication (this uses password stored as plaintext)
+#  - Grafana requires a better database backend than SQLite
+#  - Playbook could generally be better (structured, variable extraction, proper file permissions)
+---
+- hosts: all
+
+  ############################################################################
+  # Prometheus & Grafana for metrics collection & display
+  ############################################################################
+
+  roles:
+    - williamyeh.prometheus
+    - ansiblebit.grafana
+
+  vars:
+    prometheus_components:
+      - prometheus
+      - node_exporter
+      - alertmanager
+    prometheus_conf_main: prometheus/prometheus.yml
+    prometheus_alertmanager_conf: prometheus/alertmanager.yml
+    prometheus_alertmanager_url: 'http://localhost:9093'
+    prometheus_node_exporter_opts: '--collectors.enabled conntrack,diskstats,entropy,filefd,filesystem,hwmon,loadavg,logind,mdadm,meminfo,netdev,netstat,ntp,sockstat,stat,textfile,time,uname,vmstat --collector.ntp.server ntp.ubuntu.com'
+    grafana_admin_password: "password"
+    grafana_conf_data: |
+      app_mode = development
+
+      [paths]
+      data = {{ grafana_dir_data }}
+      logs = {{ grafana_dir_log }}
+      plugins = {{ grafana_dir_plugins }}
+
+      [server]
+      protocol = http
+      http_port = {{ grafana_http_port }}
+
+      [database]
+      type = {{ grafana_database.type }}
+      host = {{ grafana_database.host }}
+      name = {{ grafana_database.name }}
+      user = {{ grafana_database.user }}
+      password = {{ grafana_database.password }}
+      path = {{ grafana_database.path }}
+
+      [session]
+
+      [analytics]
+      check_for_updates = true
+
+      [security]
+      admin_user = {{ grafana_admin_user }}
+      admin_password = {{ grafana_admin_password }}
+
+      [snapshots]
+
+      [users]
+
+      [auth.anonymous]
+
+      [auth.github]
+
+      [auth.google]
+
+      [auth.proxy]
+
+      [auth.basic]
+
+      [auth.ldap]
+
+      [smtp]
+
+      [emails]
+
+      [log]
+      mode = file
+      level = Info
+
+      [log.console]
+
+      [log.file]
+
+      [event_publisher]
+
+      [dashboards.json]
+      enabled = true
+      path = /var/lib/grafana/dashboards
+
+  tasks:
+    - name: "deploy Prometheus alert rules"
+      copy:
+        src: "prometheus/alerts.rules"
+        dest: "{{ prometheus_rule_path }}/alerts.rules"
+        owner: root
+        group: root
+        mode: 0644
+      notify:
+        - restart prometheus
+
+
+    - name: "remove Grafana install detritus"
+      file:
+        path: "{{item}}"
+        state: absent
+      with_items:
+        - grafana_dir_conf
+        - grafana_dir_data
+        - grafana_dir_home
+        - grafana_dir_log
+        - grafana_dir_plugins
+
+    - name: "check if Prometheus data source set up"
+      uri:
+        url: http://localhost:3000/api/datasources/name/Prometheus
+        user: "{{grafana_admin_user}}"
+        password: "{{grafana_admin_password}}"
+        force_basic_auth: yes
+      register: grafana_prometheus
+      failed_when: false
+      changed_when: false
+
+    - name: "enable Prometheus Datasource"
+      uri:
+        url: http://localhost:3000/api/datasources
+        method: POST
+        user: "{{grafana_admin_user}}"
+        password: "{{grafana_admin_password}}"
+        body:
+          name: "Prometheus"
+          type: "prometheus"
+          url: "http://localhost:9090"
+          access: "proxy"
+          isDefault: true
+        force_basic_auth: yes
+        status_code: 200
+        body_format: json
+      when: grafana_prometheus.status == 404
+
+    ############################################################################
+    # Install SW utilities
+    ############################################################################
+
+    - name: "install virtualenv"
+      apt:
+        name: "{{item}}"
+        state: latest
+        update-cache: yes
+      with_items:
+        - ntp
+        - python-virtualenv
+
+    ############################################################################
+    # NGINX & UWSGI for web and application servers
+    ############################################################################
+
+    - name: "ensure web server packages are installed"
+      apt:
+        name: "{{item}}"
+        state: latest
+        update_cache: yes
+      with_items:
+        - nginx
+        - uwsgi
+        - uwsgi-plugin-python
+
+    - name: "ensure default configuration files absent"
+      file:
+        path: "{{item}}"
+        state: absent
+      with_items:
+        - /etc/nginx/sites-available/default
+        - /etc/nginx/sites-enabled/default
+
+    - name: "add NGINX extras to enable Prometheus plugin"
+      apt:
+        name: "{{item}}"
+        state: latest
+        update_cache: yes
+      with_items:
+        - nginx-extras
+
+    - name: "get NGINX Prometheus metrics plugin"
+      git:
+        repo: "https://github.com/knyar/nginx-lua-prometheus.git"
+        dest: /opt/nginx-lua-prometheus
+
+    - name: "deploy Prometheus metrics NGINX configuration"
+      copy:
+        src: prometheus/metrics.nginx.conf
+        dest: /etc/nginx/sites-available/prometheus-metrics.conf
+        owner: root
+        group: root
+        mode: 0644
+      notify:
+        - nginx reloaded
+
+    - name: "enable Prometheus metrics NGINX configuration"
+      file:
+        src: /etc/nginx/sites-available/prometheus-metrics.conf
+        dest: /etc/nginx/sites-enabled/prometheus-metrics.conf
+        state: link
+        force: yes
+
+    ############################################################################
+    # Echo UWSGI parameters application
+    ############################################################################
+
+    - name: "create echo UWSGI parameters software directory"
+      file:
+        dest: /opt/echo-uwsgi-parameters
+        state: directory
+        owner: root
+        group: root
+        mode: 0755
+
+    - name: "deploy echo UWSGI parameters software"
+      copy:
+        src: echo-uwsgi-parameters/app.py
+        dest: /opt/echo-uwsgi-parameters/app.py
+        owner: root
+        group: root
+        mode: 0644
+      notify:
+        - uwsgi restarted
+
+    - name: "deploy echo UWSGI parameters NGINX configuration"
+      copy:
+        src: echo-uwsgi-parameters/nginx.conf
+        dest: /etc/nginx/sites-available/echo-uwsgi-parameters.conf
+        owner: root
+        group: root
+        mode: 0644
+      notify:
+        - nginx reloaded
+
+    - name: "enable echo UWSGI parameters NGINX configuration"
+      file:
+        src: /etc/nginx/sites-available/echo-uwsgi-parameters.conf
+        dest: /etc/nginx/sites-enabled/echo-uwsgi-parameters.conf
+        state: link
+        force: yes
+
+    - name: "deploy echo UWSGI parameters UWSGI configuration"
+      copy:
+        src: echo-uwsgi-parameters/uwsgi.ini
+        dest: /etc/uwsgi/apps-available/echo-uwsgi-parameters.ini
+        owner: root
+        group: root
+        mode: 0644
+      notify:
+        - uwsgi restarted
+
+    - name: "enable echo UWSGI parameters UWSGI configuration"
+      file:
+        src: /etc/uwsgi/apps-available/echo-uwsgi-parameters.ini
+        dest: /etc/uwsgi/apps-enabled/echo-uwsgi-parameters.ini
+        state: link
+        force: yes
+
+    ############################################################################
+    # RabbitMQ message server
+    ############################################################################
+
+    - name: "install RabbitMQ"
+      apt:
+        name: rabbitmq-server
+        state: latest
+        update_cache: yes
+
+    - name: "configure RabbitMQ management plugin"
+      rabbitmq_plugin:
+        names: rabbitmq_management
+        state: enabled
+      notify:
+        - rabbitmq reloaded
+
+    - name: "create RabbitMQ admin user"
+      rabbitmq_user:
+        name: admin
+        state: present
+        password: password
+        tags: admin,monitoring
+        read_priv: ".*"
+        write_priv: ".*"
+        configure_priv: ".*"
+      notify:
+        - rabbitmq reloaded
+
+    ############################################################################
+    # Post RabbitMQ message application
+    ############################################################################
+
+    - name: "create post RabbitMQ message software directory"
+      file:
+        dest: /opt/post-rabbitmq-message
+        state: directory
+        owner: root
+        group: root
+        mode: 0755
+
+    - name: "copy post RabbitMQ message requirements.txt to machine"
+      copy:
+        src: post-rabbitmq-message/requirements.txt
+        dest: /opt/post-rabbitmq-message/requirements.txt
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: "install post RabbitMQ message virtualenv deployment tools"
+      pip:
+        name: "{{item}}"
+        state: latest
+        virtualenv: /opt/post-rabbitmq-message/venv
+      with_items:
+        - pip
+        - setuptools
+
+    - name: "install post RabbitMQ message dependencies"
+      pip:
+        requirements: /opt/post-rabbitmq-message/requirements.txt
+        virtualenv: /opt/post-rabbitmq-message/venv
+
+    - name: "deploy post RabbitMQ message software"
+      copy:
+        src: post-rabbitmq-message/app.py
+        dest: /opt/post-rabbitmq-message/app.py
+        owner: root
+        group: root
+        mode: 0644
+      notify:
+        - uwsgi restarted
+
+    - name: "deploy post RabbitMQ message NGINX configuration"
+      copy:
+        src: post-rabbitmq-message/nginx.conf
+        dest: /etc/nginx/sites-available/post-rabbitmq-message.conf
+        owner: root
+        group: root
+        mode: 0644
+      notify:
+        - nginx reloaded
+
+    - name: "enable post RabbitMQ message NGINX configuration"
+      file:
+        src: /etc/nginx/sites-available/post-rabbitmq-message.conf
+        dest: /etc/nginx/sites-enabled/post-rabbitmq-message.conf
+        state: link
+        force: yes
+
+    - name: "deploy post RabbitMQ message UWSGI configuration"
+      copy:
+        src: post-rabbitmq-message/uwsgi.ini
+        dest: /etc/uwsgi/apps-available/post-rabbitmq-message.ini
+        owner: root
+        group: root
+        mode: 0644
+      notify:
+        - uwsgi restarted
+
+    - name: "enable post RabbitMQ message UWSGI configuration"
+      file:
+        src: /etc/uwsgi/apps-available/post-rabbitmq-message.ini
+        dest: /etc/uwsgi/apps-enabled/post-rabbitmq-message.ini
+        state: link
+        force: yes
+
+    ############################################################################
+    # general process metrics application
+    ############################################################################
+
+    - name: "create general process metrics software directory"
+      file:
+        dest: /opt/general-process-metrics
+        state: directory
+        owner: root
+        group: root
+        mode: 0755
+
+    - name: "copy general process metrics requirements.txt to machine"
+      copy:
+        src: general-process-metrics/requirements.txt
+        dest: /opt/general-process-metrics/requirements.txt
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: "install general process metrics virtualenv deployment tools"
+      pip:
+        name: "{{item}}"
+        state: latest
+        virtualenv: /opt/general-process-metrics/venv
+      with_items:
+        - pip
+        - setuptools
+
+    - name: "install general process metrics dependencies"
+      pip:
+        requirements: /opt/general-process-metrics/requirements.txt
+        virtualenv: /opt/general-process-metrics/venv
+
+    - name: "deploy general process metrics software"
+      copy:
+        src: general-process-metrics/app.py
+        dest: /opt/general-process-metrics/app.py
+        owner: root
+        group: root
+        mode: 0644
+      notify:
+        - uwsgi restarted
+
+    - name: "deploy general process metrics NGINX configuration"
+      copy:
+        src: general-process-metrics/nginx.conf
+        dest: /etc/nginx/sites-available/general-process-metrics.conf
+        owner: root
+        group: root
+        mode: 0644
+      notify:
+        - nginx reloaded
+
+    - name: "enable general process metrics NGINX configuration"
+      file:
+        src: /etc/nginx/sites-available/general-process-metrics.conf
+        dest: /etc/nginx/sites-enabled/general-process-metrics.conf
+        state: link
+        force: yes
+
+    - name: "deploy general process metrics UWSGI configuration"
+      copy:
+        src: general-process-metrics/uwsgi.ini
+        dest: /etc/uwsgi/apps-available/general-process-metrics.ini
+        owner: root
+        group: root
+        mode: 0644
+      notify:
+        - uwsgi restarted
+
+    - name: "enable general process metrics UWSGI configuration"
+      file:
+        src: /etc/uwsgi/apps-available/general-process-metrics.ini
+        dest: /etc/uwsgi/apps-enabled/general-process-metrics.ini
+        state: link
+        force: yes
+
+    ############################################################################
+    # Grafana dashboards setup
+    ############################################################################
+
+    - name: "create Grafana dashboards directory"
+      file:
+        dest: /var/lib/grafana/dashboards
+        state: directory
+        owner: grafana
+        group: grafana
+        mode: 0755
+
+    - name: "deploy Grafana dashboard configuration files"
+      copy:
+        src: "{{ item }}"
+        dest: /var/lib/grafana/dashboards/
+        owner: grafana
+        group: grafana
+        mode: 0644
+      with_fileglob:
+        "grafana/dashboards/*.json"
+      notify:
+        - restart grafana
+
+  handlers:
+    - name: "nginx reloaded"
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: "uwsgi restarted"
+      service:
+        name: uwsgi
+        state: restarted
+
+    - name: "rabbitmq reloaded"
+      service:
+        name: rabbitmq-server
+        state: reloaded
+...

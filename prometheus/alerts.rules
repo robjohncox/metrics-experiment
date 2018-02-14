@@ -1,0 +1,6 @@
+ALERT HighRequestRate
+  IF sum(irate(nginx_http_requests_total[5m])) > 0.25
+  ANNOTATIONS {
+    summary = "High request rate on {{ $labels.instance }}",
+    description = "{{ $labels.instance }} has a median request rate above 0.25 (current value: {{ $value }}s)",
+  }

@@ -1,0 +1,13 @@
+# The root route with all parameters, which are inherited by the child
+# routes if they are not overwritten.
+route:
+  receiver: 'the-receiver'
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  group_by: [alertname]
+
+receivers:
+  - name: 'the-receiver'
+    webhook_configs:
+      - url: http://localhost:8001
